@@ -1,0 +1,7 @@
+numpy
+pandas
+streamlit
+yfinance
+feedparser
+openai
+streamlit-autorefresh

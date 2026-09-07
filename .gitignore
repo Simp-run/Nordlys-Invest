@@ -1,0 +1,6 @@
+investeringer.db
+nordlys.log
+.env
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
