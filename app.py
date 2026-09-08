@@ -226,7 +226,8 @@ def analyse(prices: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
                 "updated": df.index[-1].date()}
 
 
-def backtest(df: pd.DataFrame, fee_pct: float = 0.15, benchmark: pd.DataFrame | None = None, profile: str = "Balansert") -> dict:
+def backtest(df: pd.DataFrame, fee_pct: float = 0.15, benchmark: pd.DataFrame | None = None, profile: str = "Balansert",
+             stop_loss_pct: float = 0.0, trailing_stop_pct: float = 0.0, min_hold_days: int = 1) -> dict:
     test = df.dropna(subset=["SMA50"]).copy()
     test = test.dropna(subset=["RSI", "MACD", "MACD_signal"])
     if test.empty:
@@ -239,7 +240,28 @@ def backtest(df: pd.DataFrame, fee_pct: float = 0.15, benchmark: pd.DataFrame | 
         rsi_low, rsi_high, require_macd, trend_column = 40, 75, True, "SMA50"
     macd_rule = test["MACD"] > test["MACD_signal"] if require_macd else pd.Series(True, index=test.index)
     trend_rule = test["Close"] > test[trend_column]
-    test["position"] = (trend_rule & test["RSI"].between(rsi_low, rsi_high) & macd_rule).astype(int)
+    raw_position = (trend_rule & test["RSI"].between(rsi_low, rsi_high) & macd_rule).astype(int)
+    position, entry_price, peak_price, held_days = [], None, None, 0
+    for close, wanted in zip(test["Close"], raw_position):
+        if not position or position[-1] == 0:
+            if wanted:
+                entry_price, peak_price, held_days = float(close), float(close), 0
+                position.append(1)
+            else:
+                position.append(0)
+            continue
+        held_days += 1
+        peak_price = max(peak_price, float(close))
+        stop_hit = stop_loss_pct > 0 and close <= entry_price * (1 - stop_loss_pct / 100)
+        trailing_hit = trailing_stop_pct > 0 and close <= peak_price * (1 - trailing_stop_pct / 100)
+        can_exit = held_days >= max(1, min_hold_days)
+        if can_exit and (not wanted or stop_hit or trailing_hit):
+            position.append(0)
+            entry_price = peak_price = None
+            held_days = 0
+        else:
+            position.append(1)
+    test["position"] = pd.Series(position, index=test.index, dtype=int)
     test["market_return"] = test["Close"].pct_change().fillna(0)
     test["strategy_return"] = test["position"].shift(1).fillna(0) * test["market_return"]
     trades = test["position"].diff().abs().fillna(0)
@@ -269,6 +291,23 @@ def backtest(df: pd.DataFrame, fee_pct: float = 0.15, benchmark: pd.DataFrame | 
             "invested_market_return": invested_market_return,
             "win_rate": (trade_returns > 0).mean() * 100 if len(trade_returns) else 0,
             "annualized": annualized * 100, "sharpe": (test["strategy_return"].mean() / daily_vol * np.sqrt(252)) if daily_vol else 0}
+
+
+def strategy_score(result: dict) -> float:
+    """Sammenlign strategier uten å belønne høy risiko alene."""
+    return float(result["strategy"] - max(0.0, abs(result["drawdown"]) - 10) * 0.5
+                 + result["sharpe"] * 5 + result["excess"] * 0.25)
+
+
+def parameter_sensitivity(df: pd.DataFrame, fee_pct: float, benchmark: pd.DataFrame | None, profile: str,
+                          stop_loss_pct: float, trailing_stop_pct: float, min_hold_days: int) -> pd.DataFrame:
+    rows = []
+    for hold in sorted(set([1, min_hold_days, 5, 10])):
+        result = backtest(df, fee_pct, benchmark, profile, stop_loss_pct, trailing_stop_pct, hold)
+        rows.append({"Minste holdetid": hold, "Strategi %": result["strategy"],
+                     "Eksponering %": result["exposure"], "Handler": result["trades"],
+                     "Score": strategy_score(result)})
+    return pd.DataFrame(rows)
 
 
 def correlation_data(symbols: list[str], period: str = "1y") -> pd.DataFrame:
@@ -388,6 +427,9 @@ with st.sidebar:
     max_position_pct = st.slider("Maks én posisjon (%)", 5, 50, 25)
     risk_per_trade_pct = st.slider("Maks risiko per handel (%)", 0.5, 5.0, 2.0, step=0.5)
     fee_pct = st.number_input("Kostnad per kjøp/salg (%)", min_value=0.0, max_value=2.0, value=0.15, step=0.05)
+    stop_loss_pct = st.slider("Backtest stop-loss (%)", 0.0, 30.0, 0.0, step=1.0, help="0 = av. Brukes kun i historisk simulering.")
+    trailing_stop_pct = st.slider("Trailing stop (%)", 0.0, 30.0, 0.0, step=1.0, help="0 = av. Følger høyeste kurs etter inngang.")
+    min_hold_days = st.slider("Minimum holdetid (dager)", 1, 20, 1, help="Reduserer raske inn- og ut-signaler.")
     benchmark_symbol = st.text_input("Benchmark", "^OSEBX", help="Yahoo-symbol for sammenligning, f.eks. ^OSEBX for Oslo Børs eller SPY for USA")
     strategy_profile = st.selectbox("Strategiprofil", ["Konservativ", "Balansert", "Offensiv"], index=1)
     technical_weight = st.slider("Teknisk vekt (%)", 0, 100, 70)
@@ -516,7 +558,8 @@ with tab_overview:
         st.line_chart(history_chart)
     st.markdown("#### Historisk simulering")
     benchmark_prices = load_prices(benchmark_symbol, period) if benchmark_symbol else None
-    bt = backtest(df, fee_pct=fee_pct, benchmark=benchmark_prices, profile=strategy_profile)
+    bt = backtest(df, fee_pct=fee_pct, benchmark=benchmark_prices, profile=strategy_profile,
+                  stop_loss_pct=stop_loss_pct, trailing_stop_pct=trailing_stop_pct, min_hold_days=min_hold_days)
     x, y, z, q = st.columns(4)
     x.metric("Strategiavkastning", f"{bt['strategy']:+.1f}%")
     y.metric(f"Benchmark ({benchmark_symbol})", f"{bt['market']:+.1f}%")
@@ -543,7 +586,8 @@ with tab_overview:
     st.markdown("#### Sammenligning av strategiprofiler")
     profile_rows = []
     for profile_name in ["Konservativ", "Balansert", "Offensiv"]:
-        profile_result = backtest(df, fee_pct=fee_pct, benchmark=benchmark_prices, profile=profile_name)
+        profile_result = backtest(df, fee_pct=fee_pct, benchmark=benchmark_prices, profile=profile_name,
+                                  stop_loss_pct=stop_loss_pct, trailing_stop_pct=trailing_stop_pct, min_hold_days=min_hold_days)
         profile_rows.append({"Profil": profile_name, "Strategi %": profile_result["strategy"],
                              "Benchmark %": profile_result["market"], "Største fall %": profile_result["drawdown"],
                              "Treffprosent %": profile_result["win_rate"], "Handler": profile_result["trades"],
@@ -554,10 +598,20 @@ with tab_overview:
     st.markdown("#### Følsomhet for handelskostnad")
     fee_rows = []
     for fee_test in [0.0, 0.15, 0.30, 0.50]:
-        fee_result = backtest(df, fee_pct=fee_test, benchmark=benchmark_prices, profile=strategy_profile)
+        fee_result = backtest(df, fee_pct=fee_test, benchmark=benchmark_prices, profile=strategy_profile,
+                              stop_loss_pct=stop_loss_pct, trailing_stop_pct=trailing_stop_pct, min_hold_days=min_hold_days)
         fee_rows.append({"Kostnad per endring %": fee_test, "Strategi %": fee_result["strategy"], "Handler": fee_result["trades"]})
     fee_table = pd.DataFrame(fee_rows)
     st.dataframe(fee_table.style.format({"Kostnad per endring %":"{:.2f}", "Strategi %":"{:+.1f}"}), use_container_width=True, hide_index=True)
+    st.markdown("#### Følsomhet for minimum holdetid")
+    hold_table = parameter_sensitivity(df, fee_pct, benchmark_prices, strategy_profile, stop_loss_pct, trailing_stop_pct, min_hold_days)
+    st.dataframe(hold_table.style.format({"Strategi %":"{:+.1f}", "Eksponering %":"{:.1f}", "Score":"{:+.2f}"}), use_container_width=True, hide_index=True)
+    st.download_button("Last ned full backtest som CSV", pd.concat([
+        pd.DataFrame([{"Måling": "strategi", "Verdi": bt["strategy"]}, {"Måling": "benchmark", "Verdi": bt["market"]},
+                      {"Måling": "eksponering", "Verdi": bt["exposure"]}, {"Måling": "kontantandel", "Verdi": bt["cash_share"]},
+                      {"Måling": "sharpe", "Verdi": bt["sharpe"]}]),
+        hold_table.rename(columns={"Minste holdetid": "Måling"})
+    ], ignore_index=True).to_csv(index=False).encode("utf-8"), "backtest.csv", "text/csv")
     st.markdown("#### Walk-forward-test")
     wf = walk_forward(df, fee_pct, strategy_profile)
     if wf.empty:
