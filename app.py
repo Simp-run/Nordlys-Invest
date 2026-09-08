@@ -232,13 +232,14 @@ def backtest(df: pd.DataFrame, fee_pct: float = 0.15, benchmark: pd.DataFrame | 
     if test.empty:
         raise ValueError("For lite historikk til å kjøre backtest.")
     if profile == "Konservativ":
-        rsi_low, rsi_high, require_macd = 50, 65, True
+        rsi_low, rsi_high, require_macd, trend_column = 50, 65, True, "SMA200"
     elif profile == "Offensiv":
-        rsi_low, rsi_high, require_macd = 35, 75, False
+        rsi_low, rsi_high, require_macd, trend_column = 30, 80, False, "SMA20"
     else:
-        rsi_low, rsi_high, require_macd = 45, 70, True
+        rsi_low, rsi_high, require_macd, trend_column = 40, 75, True, "SMA50"
     macd_rule = test["MACD"] > test["MACD_signal"] if require_macd else pd.Series(True, index=test.index)
-    test["position"] = ((test["Close"] > test["SMA50"]) & (test["RSI"].between(rsi_low, rsi_high)) & macd_rule).astype(int)
+    trend_rule = test["Close"] > test[trend_column]
+    test["position"] = (trend_rule & test["RSI"].between(rsi_low, rsi_high) & macd_rule).astype(int)
     test["market_return"] = test["Close"].pct_change().fillna(0)
     test["strategy_return"] = test["position"].shift(1).fillna(0) * test["market_return"]
     trades = test["position"].diff().abs().fillna(0)
@@ -254,7 +255,9 @@ def backtest(df: pd.DataFrame, fee_pct: float = 0.15, benchmark: pd.DataFrame | 
         # feil dersom den har en annen historikkperiode enn aksjen.
         benchmark_series = benchmark["Close"].pct_change().reindex(test.index).fillna(0)
         benchmark_return = (1 + benchmark_series).prod() * 100 - 100
-    return {"strategy": (equity.iloc[-1] - 1) * 100, "market": benchmark_return,
+    strategy_return_pct = (equity.iloc[-1] - 1) * 100
+    return {"strategy": strategy_return_pct, "market": benchmark_return,
+            "excess": strategy_return_pct - benchmark_return,
             "drawdown": drawdown.min() * 100, "days": len(test), "equity": equity, "strategy_series": test["strategy_return"],
             "trades": int(trades.sum()), "win_rate": (trade_returns > 0).mean() * 100 if len(trade_returns) else 0,
             "annualized": annualized * 100, "sharpe": (test["strategy_return"].mean() / daily_vol * np.sqrt(252)) if daily_vol else 0}
@@ -515,6 +518,10 @@ with tab_overview:
     x2.metric("Antall posisjonsendringer", str(bt["trades"]))
     y2.metric("Annualisert", f"{bt['annualized']:+.1f}%")
     z2.metric("Sharpe-lignende", f"{bt['sharpe']:.2f}")
+    if bt["excess"] < 0:
+        st.warning(f"Strategien ligger {abs(bt['excess']):.1f} prosentpoeng under benchmark i denne historiske perioden.")
+    else:
+        st.success(f"Strategien ligger {bt['excess']:.1f} prosentpoeng over benchmark i denne historiske perioden.")
     st.line_chart(bt["equity"].rename("Simulert verdi (start = 1,00)"))
     st.caption(f"Profil: {strategy_profile}. Backtesten bruker {fee_pct:.2f}% kostnad per posisjonsendring. Skatt og ekstra slippage er ikke medregnet.")
     st.markdown("#### Sammenligning av strategiprofiler")
