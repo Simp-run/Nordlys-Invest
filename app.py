@@ -6,6 +6,7 @@ import yfinance as yf
 import feedparser
 import os
 import json
+import html
 import sqlite3
 from pathlib import Path
 try:
@@ -32,13 +33,20 @@ NEWS_ALIASES = {"DNB.OL": ["dnb", "dnb bank"], "EQNR.OL": ["equinor", "eqnr"], "
                 "NHY.OL": ["norsk hydro", "hydro", "nhy"], "AAPL": ["apple"], "MSFT": ["microsoft"],
                 "NVDA": ["nvidia"], "TSLA": ["tesla"], "AMZN": ["amazon"], "GOOGL": ["google", "alphabet"],
                 "META": ["meta", "facebook"]}
-DB_PATH = "investeringer.db"
+# Kan overstyres i Streamlit Secrets/miljøvariabler dersom databasen skal ligge
+# på et persistent volum. Lokal SQLite-lagring på Streamlit Cloud er ellers
+# midlertidig og kan forsvinne ved omstart/redeploy.
+DB_PATH = os.getenv("NORDLYS_DB_PATH", "investeringer.db")
 logging.basicConfig(filename="nordlys.log", level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("nordlys")
 
 
 def init_db() -> None:
-    with sqlite3.connect(DB_PATH) as con:
+    db_parent = Path(DB_PATH).expanduser().parent
+    if str(db_parent) not in ("", "."):
+        db_parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(DB_PATH, timeout=10) as con:
+        con.execute("PRAGMA busy_timeout = 5000")
         con.executescript("""
         CREATE TABLE IF NOT EXISTS analyses (
             id INTEGER PRIMARY KEY, symbol TEXT, recorded_at TEXT, score INTEGER,
@@ -59,7 +67,7 @@ def init_db() -> None:
 
 
 def save_analysis(symbol: str, result: dict) -> None:
-    with sqlite3.connect(DB_PATH) as con:
+    with sqlite3.connect(DB_PATH, timeout=10) as con:
         con.execute("INSERT INTO analyses(symbol,recorded_at,score,signal,close,return_1m,return_3m,volatility,total_score,recommendation) VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (symbol, datetime.now().isoformat(timespec="seconds"), result["score"], result["signal"],
                      result["close"], result["return_1m"], result["return_3m"], result["volatility"],
@@ -69,7 +77,7 @@ def save_analysis(symbol: str, result: dict) -> None:
 def save_news(symbol: str, frame: pd.DataFrame) -> None:
     if frame.empty:
         return
-    with sqlite3.connect(DB_PATH) as con:
+    with sqlite3.connect(DB_PATH, timeout=10) as con:
         for _, item in frame.iterrows():
             con.execute("""
                 INSERT INTO news(symbol,title,source,link,published,score,explanation,recorded_at)
@@ -84,7 +92,7 @@ def save_news(symbol: str, frame: pd.DataFrame) -> None:
 
 
 def saved_ai_news(symbol: str) -> dict:
-    with sqlite3.connect(DB_PATH) as con:
+    with sqlite3.connect(DB_PATH, timeout=10) as con:
         rows = con.execute("SELECT title, score, explanation FROM news WHERE symbol = ? AND explanation != ''", (symbol,)).fetchall()
     return {title: (score, explanation) for title, score, explanation in rows}
 
@@ -101,6 +109,9 @@ def fetch_news(symbol: str, limit: int = 10) -> pd.DataFrame:
         feed = feedparser.parse(feed_url)
         for entry in feed.entries[:limit]:
             title = re.sub(r"\s+", " ", entry.get("title", "").strip())
+            link = entry.get("link", "")
+            if not link.startswith(("http://", "https://")):
+                link = ""
             aliases = NEWS_ALIASES.get(symbol, [symbol.replace(".OL", "").lower()])
             relevant = any(alias in title.lower() for alias in aliases)
             if not relevant and source != "NewsWeb":
@@ -109,7 +120,7 @@ def fetch_news(symbol: str, limit: int = 10) -> pd.DataFrame:
             score = max(-5, min(5, len(words & POSITIVE) - len(words & NEGATIVE)))
             category = "Børsmelding" if source == "NewsWeb" else ("Resultat" if any(w in title.lower() for w in ["result", "quarter", "earnings"]) else "Marked")
             rows.append({"Kilde": source, "Tittel": title, "Score": score,
-                         "Lenke": entry.get("link", ""), "Dato": entry.get("published", ""), "Type": category,
+                         "Lenke": link, "Dato": entry.get("published", ""), "Type": category,
                          "Relevans": "Høy" if relevant else "Usikker"})
     frame = pd.DataFrame(rows)
     if frame.empty:
@@ -159,8 +170,9 @@ def load_prices(symbol: str, period: str = "2y") -> pd.DataFrame:
     if isinstance(prices.columns, pd.MultiIndex):
         prices.columns = prices.columns.get_level_values(0)
     prices.columns = [str(c).title() for c in prices.columns]
-    prices.index = pd.to_datetime(prices.index).tz_localize(None)
-    return prices.dropna(subset=["Close"])
+    index = pd.to_datetime(prices.index)
+    prices.index = index.tz_localize(None) if index.tz is not None else index
+    return prices.dropna(subset=["Close"]).sort_index()
 
 
 def database_bytes() -> bytes:
@@ -197,7 +209,10 @@ def analyse(prices: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     df["Support"] = df["Low"].rolling(20).min()
     df["Resistance"] = df["High"].rolling(20).max()
     df["Trend_strength"] = (df["SMA20"] - df["SMA50"]).abs() / df["ATR"].replace(0, np.nan)
-    last = df.dropna().iloc[-1]
+    usable = df.dropna()
+    if usable.empty:
+        raise ValueError("For lite eller ufullstendig kursdata til å beregne indikatorene.")
+    last = usable.iloc[-1]
     score = sum([2 if last.Close > last.SMA50 else -2, 2 if last.SMA20 > last.SMA50 else -1,
                  2 if last.SMA50 > last.SMA200 else -1, 2 if last.Return_1m > 0 else -1,
                  2 if last.Return_3m > 0 else -1, 1 if 50 <= last.RSI <= 70 else -1,
@@ -214,6 +229,8 @@ def analyse(prices: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 def backtest(df: pd.DataFrame, fee_pct: float = 0.15, benchmark: pd.DataFrame | None = None, profile: str = "Balansert") -> dict:
     test = df.dropna(subset=["SMA50"]).copy()
     test = test.dropna(subset=["RSI", "MACD", "MACD_signal"])
+    if test.empty:
+        raise ValueError("For lite historikk til å kjøre backtest.")
     if profile == "Konservativ":
         rsi_low, rsi_high, require_macd = 50, 65, True
     elif profile == "Offensiv":
@@ -233,7 +250,10 @@ def backtest(df: pd.DataFrame, fee_pct: float = 0.15, benchmark: pd.DataFrame | 
     annualized = equity.iloc[-1] ** (252 / max(len(test), 1)) - 1
     benchmark_return = (1 + test["market_return"]).prod() * 100 - 100
     if benchmark is not None and not benchmark.empty:
-        benchmark_return = (1 + benchmark["Close"].pct_change().dropna()).prod() * 100 - 100
+        # Sammenlign kun samme datoer som strategien, ellers blir benchmarken
+        # feil dersom den har en annen historikkperiode enn aksjen.
+        benchmark_series = benchmark["Close"].pct_change().reindex(test.index).fillna(0)
+        benchmark_return = (1 + benchmark_series).prod() * 100 - 100
     return {"strategy": (equity.iloc[-1] - 1) * 100, "market": benchmark_return,
             "drawdown": drawdown.min() * 100, "days": len(test), "equity": equity, "strategy_series": test["strategy_return"],
             "trades": int(trades.sum()), "win_rate": (trade_returns > 0).mean() * 100 if len(trade_returns) else 0,
@@ -344,6 +364,7 @@ section[data-testid="stSidebar"] [data-testid="stSidebarContent"]::-webkit-scrol
 st.title("Nordlys Invest")
 st.caption("MARKEDSOVERSIKT  /  MOMENTUM  /  NYHETER  /  RISIKO")
 st.caption(f"Sist oppdatert: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
+st.info("Dette er et analyseverktøy, ikke personlig investeringsrådgivning. Historiske resultater og modellsignaler garanterer ikke fremtidig avkastning.")
 with st.sidebar:
     st.header("Analyse")
     raw = st.text_area("Watchlist (Yahoo-symboler)", "EQNR.OL\nDNB.OL\nAAPL\nMSFT")
@@ -396,7 +417,7 @@ if run or "results" not in st.session_state:
             technical_direction = 1 if result["score"] > 0 else -1 if result["score"] < 0 else 0
             news_direction = 1 if result["news_sentiment"] > 0 else -1 if result["news_sentiment"] < 0 else 0
             result["confidence"] = "Høy" if technical_direction == news_direction and technical_direction != 0 else "Middels" if technical_direction == 0 or news_direction == 0 else "Lav"
-            result["recommendation"] = ("KJØP" if result["total_score"] >= 7 else "FØLG MED" if result["total_score"] >= 3 else "HOLD" if result["total_score"] >= 0 else "UNNGÅ")
+            result["recommendation"] = ("POSITIVT SIGNAL" if result["total_score"] >= 7 else "FØLG MED" if result["total_score"] >= 3 else "NØYTRALT SIGNAL" if result["total_score"] >= 0 else "NEGATIVT SIGNAL")
             save_analysis(symbol, result)
             results.append(result)
         except Exception as exc:
@@ -436,7 +457,7 @@ if table.empty:
 table = table.sort_values("total_score", ascending=False)
 st.subheader("Rangering")
 st.dataframe(table[["symbol", "recommendation", "confidence", "signal", "score", "news_sentiment", "news_count", "total_score", "close", "return_1m", "return_3m", "volatility", "updated"]], use_container_width=True, hide_index=True)
-strong = table[table["recommendation"] == "KJØP"]["symbol"].tolist()
+strong = table[table["recommendation"] == "POSITIVT SIGNAL"]["symbol"].tolist()
 weak_news = table[table["news_sentiment"] < 0]["symbol"].tolist()
 if strong:
     st.success("Sterke kandidater: " + ", ".join(strong))
@@ -547,8 +568,15 @@ with tab_news:
         st.caption(f"Nyeste nyheter prioriteres i visningen. {mode_text}")
         for _, item in news.iterrows():
             label = "Positiv" if item.Score > 0 else "Negativ" if item.Score < 0 else "Nøytral"
-            explanation = f"  \n_{item.Forklaring}_" if "Forklaring" in item else ""
-            st.markdown(f"**{label} ({int(item.Score):+d}) · {item.Type} · Relevans: {item.Relevans}** [{item.Tittel}]({item.Lenke})  \n<span class='muted'>{item.Kilde} · {item.Dato} · {item.Alder_dager:.0f} dager gammel</span>{explanation}", unsafe_allow_html=True)
+            explanation = f"  \n_{html.escape(str(item.Forklaring))}_" if "Forklaring" in item else ""
+            safe_title = html.escape(str(item.Tittel))
+            safe_type = html.escape(str(item.Type))
+            safe_relevance = html.escape(str(item.Relevans))
+            safe_source = html.escape(str(item.Kilde))
+            safe_date = html.escape(str(item.Dato))
+            safe_link = html.escape(str(item.Lenke), quote=True)
+            link_part = f"[{safe_title}]({safe_link})" if safe_link else safe_title
+            st.markdown(f"**{label} ({int(item.Score):+d}) · {safe_type} · Relevans: {safe_relevance}** {link_part}  \n<span class='muted'>{safe_source} · {safe_date} · {item.Alder_dager:.0f} dager gammel</span>{explanation}", unsafe_allow_html=True)
         with sqlite3.connect(DB_PATH) as con:
             news_history = pd.read_sql_query("SELECT published AS Dato, AVG(score) AS Score FROM news WHERE symbol = ? GROUP BY published ORDER BY published", con, params=(selected,))
         if len(news_history) > 1:
@@ -584,9 +612,12 @@ with tab_portfolio:
         p1, p2, p3 = st.columns(3)
         p1.metric("Porteføljeverdi", f"{pf['Verdi'].sum():,.0f}")
         p2.metric("Samlet gevinst/tap", f"{pf['Gevinst'].sum():+,.0f}")
-        p3.metric("Avkastning", f"{(pf['Verdi'].sum()/((pf['Verdi']-pf['Gevinst']).sum())-1)*100:+.1f}%")
-        weighted_volatility = (pf["Volatilitet %"] * pf["Verdi"]).sum() / pf["Verdi"].sum()
-        concentration = (pf["Verdi"] / pf["Verdi"].sum()).max() * 100
+        invested_value = (pf["Verdi"] - pf["Gevinst"]).sum()
+        portfolio_value = pf["Verdi"].sum()
+        return_pct = ((portfolio_value / invested_value) - 1) * 100 if invested_value else 0
+        p3.metric("Avkastning", f"{return_pct:+.1f}%")
+        weighted_volatility = ((pf["Volatilitet %"] * pf["Verdi"]).sum() / portfolio_value) if portfolio_value else 0
+        concentration = ((pf["Verdi"] / portfolio_value).max() * 100) if portfolio_value else 0
         p4, p5 = st.columns(2)
         p4.metric("Vektet volatilitet", f"{weighted_volatility:.1f}%")
         p5.metric("Største eksponering", f"{concentration:.1f}%")
