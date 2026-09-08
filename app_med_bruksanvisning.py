@@ -417,6 +417,18 @@ st.caption(f"Sist oppdatert: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
 st.info("Dette er et analyseverktøy, ikke personlig investeringsrådgivning. Historiske resultater og modellsignaler garanterer ikke fremtidig avkastning.")
 with st.sidebar:
     st.header("Analyse")
+    guide_path = Path(__file__).with_name("Bruksanvisning_Nordlys_Invest_v3.html")
+    if guide_path.exists():
+        st.download_button(
+            "📖 Åpne bruksanvisning",
+            guide_path.read_bytes(),
+            "Nordlys_Invest_Bruksanvisning.html",
+            "text/html",
+            use_container_width=True,
+            help="Åpner/laster ned den komplette bruksanvisningen med bilder, forklaringer og ordliste.",
+        )
+    else:
+        st.caption("📖 Bruksanvisning: last opp HTML-filen sammen med app.py")
     raw = st.text_area("Watchlist (Yahoo-symboler)", "EQNR.OL\nDNB.OL\nAAPL\nMSFT")
     period = st.selectbox("Historikk", ["1y", "2y", "5y"], index=1)
     symbols = [x.strip().upper() for x in raw.splitlines() if x.strip()]
@@ -447,17 +459,6 @@ with st.sidebar:
     analyze_all = st.button("Analyser hele watchlisten med AI", disabled=not bool(os.getenv("OPENAI_API_KEY")))
     st.caption("AI-status: aktiv" if os.getenv("OPENAI_API_KEY") else "AI-status: ikke konfigurert")
     run_validation = st.button("Kjør modellvalidering")
-    guide_path = Path(__file__).with_name("Bruksanvisning_Nordlys_Invest_v3.html")
-    if guide_path.exists():
-        st.download_button(
-            "Last ned bruksanvisning",
-            guide_path.read_bytes(),
-            "Nordlys_Invest_Bruksanvisning.html",
-            "text/html",
-            help="Laster ned den komplette bruksanvisningen med forklaringer og ordliste.",
-        )
-    else:
-        st.caption("Legg Bruksanvisning_Nordlys_Invest_v3.html i samme mappe for å aktivere bruksanvisningen.")
 
 if run or "results" not in st.session_state:
     results, errors = [], []
