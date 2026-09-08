@@ -256,10 +256,17 @@ def backtest(df: pd.DataFrame, fee_pct: float = 0.15, benchmark: pd.DataFrame | 
         benchmark_series = benchmark["Close"].pct_change().reindex(test.index).fillna(0)
         benchmark_return = (1 + benchmark_series).prod() * 100 - 100
     strategy_return_pct = (equity.iloc[-1] - 1) * 100
+    invested_days = int(test["position"].sum())
+    cash_days = int(len(test) - invested_days)
+    invested_market_returns = test.loc[test["position"].shift(1).fillna(0).astype(bool), "market_return"]
+    invested_market_return = ((1 + invested_market_returns).prod() - 1) * 100 if len(invested_market_returns) else 0.0
     return {"strategy": strategy_return_pct, "market": benchmark_return,
             "excess": strategy_return_pct - benchmark_return,
             "drawdown": drawdown.min() * 100, "days": len(test), "equity": equity, "strategy_series": test["strategy_return"],
             "trades": int(trades.sum()), "exposure": test["position"].mean() * 100,
+            "invested_days": invested_days, "cash_days": cash_days,
+            "cash_share": (cash_days / len(test) * 100) if len(test) else 0.0,
+            "invested_market_return": invested_market_return,
             "win_rate": (trade_returns > 0).mean() * 100 if len(trade_returns) else 0,
             "annualized": annualized * 100, "sharpe": (test["strategy_return"].mean() / daily_vol * np.sqrt(252)) if daily_vol else 0}
 
@@ -515,15 +522,22 @@ with tab_overview:
     y.metric(f"Benchmark ({benchmark_symbol})", f"{bt['market']:+.1f}%")
     z.metric("Største fall", f"{bt['drawdown']:.1f}%")
     q.metric("Treffprosent", f"{bt['win_rate']:.1f}%")
-    x2, y2, z2 = st.columns(3)
+    x2, y2, z2, q2 = st.columns(4)
     x2.metric("Antall posisjonsendringer", str(bt["trades"]))
     y2.metric("Annualisert", f"{bt['annualized']:+.1f}%")
     z2.metric("Sharpe-lignende", f"{bt['sharpe']:.2f}")
-    st.caption(f"Strategien var investert {bt['exposure']:.1f}% av handelsdagene. Benchmark: {benchmark_symbol}.")
+    q2.metric("Kontantandel", f"{bt['cash_share']:.1f}%")
+    st.caption(f"Strategien var investert {bt['exposure']:.1f}% av handelsdagene ({bt['invested_days']} dager) og sto i kontanter {bt['cash_share']:.1f}% av tiden ({bt['cash_days']} dager). Benchmark: {benchmark_symbol}.")
     if bt["excess"] < 0:
         st.warning(f"Strategien ligger {abs(bt['excess']):.1f} prosentpoeng under benchmark i denne historiske perioden.")
     else:
         st.success(f"Strategien ligger {bt['excess']:.1f} prosentpoeng over benchmark i denne historiske perioden.")
+    if bt["sharpe"] < 0:
+        st.warning("Sharpe-lignende mål er negativt. Strategien har hatt svak risikojustert avkastning i denne perioden.")
+    if bt["cash_share"] > 60 and bt["strategy"] < bt["market"]:
+        st.info("Strategien har hatt høy kontantandel og kan derfor ha gått glipp av deler av markedsoppgangen.")
+    if bt["exposure"] < 25:
+        st.info("Lav markedseksponering: resultatet bør tolkes som en delvis investert strategi, ikke som ren kjøp-og-hold.")
     st.line_chart(bt["equity"].rename("Simulert verdi (start = 1,00)"))
     st.caption(f"Profil: {strategy_profile}. Backtesten bruker {fee_pct:.2f}% kostnad per posisjonsendring. Skatt og ekstra slippage er ikke medregnet.")
     st.markdown("#### Sammenligning av strategiprofiler")
@@ -533,9 +547,10 @@ with tab_overview:
         profile_rows.append({"Profil": profile_name, "Strategi %": profile_result["strategy"],
                              "Benchmark %": profile_result["market"], "Største fall %": profile_result["drawdown"],
                              "Treffprosent %": profile_result["win_rate"], "Handler": profile_result["trades"],
+                             "Eksponering %": profile_result["exposure"], "Kontantandel %": profile_result["cash_share"],
                              "Sharpe": profile_result["sharpe"]})
     profile_table = pd.DataFrame(profile_rows)
-    st.dataframe(profile_table.style.format({"Strategi %":"{:+.1f}", "Benchmark %":"{:+.1f}", "Største fall %":"{:.1f}", "Treffprosent %":"{:.1f}", "Sharpe":"{:.2f}"}), use_container_width=True, hide_index=True)
+    st.dataframe(profile_table.style.format({"Strategi %":"{:+.1f}", "Benchmark %":"{:+.1f}", "Største fall %":"{:.1f}", "Treffprosent %":"{:.1f}", "Eksponering %":"{:.1f}", "Kontantandel %":"{:.1f}", "Sharpe":"{:.2f}"}), use_container_width=True, hide_index=True)
     st.markdown("#### Følsomhet for handelskostnad")
     fee_rows = []
     for fee_test in [0.0, 0.15, 0.30, 0.50]:
