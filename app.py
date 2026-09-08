@@ -259,7 +259,8 @@ def backtest(df: pd.DataFrame, fee_pct: float = 0.15, benchmark: pd.DataFrame | 
     return {"strategy": strategy_return_pct, "market": benchmark_return,
             "excess": strategy_return_pct - benchmark_return,
             "drawdown": drawdown.min() * 100, "days": len(test), "equity": equity, "strategy_series": test["strategy_return"],
-            "trades": int(trades.sum()), "win_rate": (trade_returns > 0).mean() * 100 if len(trade_returns) else 0,
+            "trades": int(trades.sum()), "exposure": test["position"].mean() * 100,
+            "win_rate": (trade_returns > 0).mean() * 100 if len(trade_returns) else 0,
             "annualized": annualized * 100, "sharpe": (test["strategy_return"].mean() / daily_vol * np.sqrt(252)) if daily_vol else 0}
 
 
@@ -380,7 +381,7 @@ with st.sidebar:
     max_position_pct = st.slider("Maks én posisjon (%)", 5, 50, 25)
     risk_per_trade_pct = st.slider("Maks risiko per handel (%)", 0.5, 5.0, 2.0, step=0.5)
     fee_pct = st.number_input("Kostnad per kjøp/salg (%)", min_value=0.0, max_value=2.0, value=0.15, step=0.05)
-    benchmark_symbol = st.text_input("Benchmark", "SPY", help="Yahoo-symbol for sammenligning, f.eks. SPY eller ^OSEBX")
+    benchmark_symbol = st.text_input("Benchmark", "^OSEBX", help="Yahoo-symbol for sammenligning, f.eks. ^OSEBX for Oslo Børs eller SPY for USA")
     strategy_profile = st.selectbox("Strategiprofil", ["Konservativ", "Balansert", "Offensiv"], index=1)
     technical_weight = st.slider("Teknisk vekt (%)", 0, 100, 70)
     news_weight = 100 - technical_weight
@@ -518,6 +519,7 @@ with tab_overview:
     x2.metric("Antall posisjonsendringer", str(bt["trades"]))
     y2.metric("Annualisert", f"{bt['annualized']:+.1f}%")
     z2.metric("Sharpe-lignende", f"{bt['sharpe']:.2f}")
+    st.caption(f"Strategien var investert {bt['exposure']:.1f}% av handelsdagene. Benchmark: {benchmark_symbol}.")
     if bt["excess"] < 0:
         st.warning(f"Strategien ligger {abs(bt['excess']):.1f} prosentpoeng under benchmark i denne historiske perioden.")
     else:
@@ -534,6 +536,13 @@ with tab_overview:
                              "Sharpe": profile_result["sharpe"]})
     profile_table = pd.DataFrame(profile_rows)
     st.dataframe(profile_table.style.format({"Strategi %":"{:+.1f}", "Benchmark %":"{:+.1f}", "Største fall %":"{:.1f}", "Treffprosent %":"{:.1f}", "Sharpe":"{:.2f}"}), use_container_width=True, hide_index=True)
+    st.markdown("#### Følsomhet for handelskostnad")
+    fee_rows = []
+    for fee_test in [0.0, 0.15, 0.30, 0.50]:
+        fee_result = backtest(df, fee_pct=fee_test, benchmark=benchmark_prices, profile=strategy_profile)
+        fee_rows.append({"Kostnad per endring %": fee_test, "Strategi %": fee_result["strategy"], "Handler": fee_result["trades"]})
+    fee_table = pd.DataFrame(fee_rows)
+    st.dataframe(fee_table.style.format({"Kostnad per endring %":"{:.2f}", "Strategi %":"{:+.1f}"}), use_container_width=True, hide_index=True)
     st.markdown("#### Walk-forward-test")
     wf = walk_forward(df, fee_pct, strategy_profile)
     if wf.empty:
